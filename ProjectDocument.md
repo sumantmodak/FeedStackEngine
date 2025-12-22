@@ -184,6 +184,236 @@ FeedStackEngine/
 
 ---
 
+## Capacity Planning & Cost Analysis
+
+This section provides detailed calculations for storage, transactions, and costs at different scales.
+
+### Assumptions
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| Average articles per feed per day | 15-25 | Varies by feed type |
+| Average article size (metadata only) | ~2 KB | Title, description, URL, etc. |
+| ArticleLookup entry size | ~0.5 KB | Minimal fields for dedup |
+| Hot storage retention | 90 days | Before archival |
+| Cold storage retention | 1 year | Before purge (future) |
+| Aggregation frequency | 24 times/day | Hourly |
+| Archival frequency | 1 time/day | Daily at 2 AM |
+
+### Scenario 1: Small Scale (8-10 Feeds)
+
+**Daily Data Generation:**
+```
+Feeds: 10
+Articles per feed per day: 20 (average)
+Total articles per day: 10 × 20 = 200 articles
+Article size: 2 KB
+Lookup entry size: 0.5 KB
+
+Daily storage growth:
+  NewsArticles: 200 × 2 KB = 400 KB/day
+  ArticleLookup: 200 × 0.5 KB = 100 KB/day
+  Total: ~500 KB/day = ~0.5 MB/day
+```
+
+**Monthly & Annual Storage:**
+| Timeframe | Hot Storage | Cold Storage | Lookup Table | Total |
+|-----------|-------------|--------------|--------------|-------|
+| 1 month | 15 MB | 0 | 15 MB | 30 MB |
+| 90 days | 45 MB | 0 | 45 MB | 90 MB |
+| 6 months | 45 MB | 45 MB | 90 MB | 180 MB |
+| 1 year | 45 MB | 135 MB | 180 MB | 360 MB |
+
+**Transaction Costs (Monthly):**
+```
+Aggregation runs: 24/day × 30 days = 720 runs
+
+Per aggregation run:
+  - Read feeds.json: ~1 read
+  - Lookup checks: 200 articles × 1 read = 200 reads
+  - Article inserts: 200 articles × 2 writes (article + lookup) = 400 writes
+  - Assuming 50% duplicates after first fetch: 100 new × 2 = 200 writes
+
+Daily transactions:
+  - Reads: 24 × (1 + 200) = 4,824 reads
+  - Writes: 24 × 200 = 4,800 writes (assuming 50% dedup)
+  
+Monthly transactions:
+  - Reads: ~145,000
+  - Writes: ~144,000
+  - Total: ~289,000 transactions
+
+Archival (monthly):
+  - Read old partitions: ~3,000 reads
+  - Write to archive: ~3,000 writes
+  - Delete from hot: ~3,000 deletes
+  - Total: ~9,000 transactions
+
+Grand total: ~298,000 transactions/month
+```
+
+**Monthly Cost Estimate (Small Scale):**
+| Resource | Calculation | Cost |
+|----------|-------------|------|
+| Storage (360 MB after 1 year) | 0.36 GB × $0.045/GB | $0.02 |
+| Transactions (298K) | 298K ÷ 10K × $0.00036 | $0.01 |
+| Azure Functions (720 executions) | Free tier | $0.00 |
+| **Total Monthly** | | **< $0.10** |
+
+---
+
+### Scenario 2: Medium Scale (50 Feeds)
+
+**Daily Data Generation:**
+```
+Feeds: 50
+Articles per feed per day: 20 (average)
+Total articles per day: 50 × 20 = 1,000 articles
+
+Daily storage growth:
+  NewsArticles: 1,000 × 2 KB = 2 MB/day
+  ArticleLookup: 1,000 × 0.5 KB = 0.5 MB/day
+  Total: ~2.5 MB/day
+```
+
+**Monthly & Annual Storage:**
+| Timeframe | Hot Storage | Cold Storage | Lookup Table | Total |
+|-----------|-------------|--------------|--------------|-------|
+| 1 month | 75 MB | 0 | 75 MB | 150 MB |
+| 90 days | 225 MB | 0 | 225 MB | 450 MB |
+| 6 months | 225 MB | 225 MB | 450 MB | 900 MB |
+| 1 year | 225 MB | 675 MB | 900 MB | 1.8 GB |
+
+**Transaction Costs (Monthly):**
+```
+Per aggregation run (assuming 50% duplicates):
+  - Lookup reads: 1,000
+  - New article writes: 500 × 2 = 1,000
+
+Daily: 24 × (1,000 + 1,000) = 48,000 transactions
+Monthly: ~1.44M transactions + ~45K archival = ~1.5M transactions
+```
+
+**Monthly Cost Estimate (Medium Scale):**
+| Resource | Calculation | Cost |
+|----------|-------------|------|
+| Storage (1.8 GB after 1 year) | 1.8 GB × $0.045/GB | $0.08 |
+| Transactions (1.5M) | 1.5M ÷ 10K × $0.00036 | $0.05 |
+| Azure Functions (720 executions) | Free tier | $0.00 |
+| **Total Monthly** | | **< $0.15** |
+
+---
+
+### Scenario 3: Large Scale (100+ Feeds)
+
+**Daily Data Generation:**
+```
+Feeds: 100
+Articles per feed per day: 20 (average)
+Total articles per day: 100 × 20 = 2,000 articles
+
+Daily storage growth:
+  NewsArticles: 2,000 × 2 KB = 4 MB/day
+  ArticleLookup: 2,000 × 0.5 KB = 1 MB/day
+  Total: ~5 MB/day
+```
+
+**Monthly & Annual Storage:**
+| Timeframe | Hot Storage | Cold Storage | Lookup Table | Total |
+|-----------|-------------|--------------|--------------|-------|
+| 1 month | 150 MB | 0 | 150 MB | 300 MB |
+| 90 days | 450 MB | 0 | 450 MB | 900 MB |
+| 6 months | 450 MB | 450 MB | 900 MB | 1.8 GB |
+| 1 year | 450 MB | 1.35 GB | 1.8 GB | 3.6 GB |
+
+**Transaction Costs (Monthly):**
+```
+Per aggregation run (assuming 50% duplicates):
+  - Lookup reads: 2,000
+  - New article writes: 1,000 × 2 = 2,000
+
+Daily: 24 × (2,000 + 2,000) = 96,000 transactions
+Monthly: ~2.9M transactions + ~90K archival = ~3M transactions
+```
+
+**Monthly Cost Estimate (Large Scale):**
+| Resource | Calculation | Cost |
+|----------|-------------|------|
+| Storage (3.6 GB after 1 year) | 3.6 GB × $0.045/GB | $0.16 |
+| Transactions (3M) | 3M ÷ 10K × $0.00036 | $0.11 |
+| Azure Functions (720 executions) | Free tier | $0.00 |
+| **Total Monthly** | | **< $0.30** |
+
+---
+
+### Cost Comparison Summary
+
+| Scale | Feeds | Daily Articles | Storage (1 year) | Monthly Cost |
+|-------|-------|----------------|------------------|--------------|
+| Small | 10 | 200 | 360 MB | < $0.10 |
+| Medium | 50 | 1,000 | 1.8 GB | < $0.15 |
+| Large | 100 | 2,000 | 3.6 GB | < $0.30 |
+| Enterprise | 500 | 10,000 | 18 GB | < $1.50 |
+
+### Future Feature Cost Impact
+
+| Feature | Additional Cost Impact |
+|---------|----------------------|
+| **Keyword Search (Option C - KeywordIndex)** | +50% storage, +100% transactions (~$0.30/month at large scale) |
+| **Keyword Search (Option A - Azure Cognitive Search)** | +$75-250/month (Basic to Standard tier) |
+| **Tag-based Personalization** | +10% transactions for TagIndex (~$0.03/month) |
+| **HTTP API (moderate usage)** | +$0-5/month (depends on traffic, mostly free tier) |
+| **Application Insights** | +$0-10/month (depends on log volume, free tier available) |
+
+### Scaling Thresholds & Recommendations
+
+| Metric | Threshold | Recommendation |
+|--------|-----------|----------------|
+| **Feeds > 50** | Concurrency matters | Batch feeds into groups, use SemaphoreSlim(10) |
+| **Feeds > 100** | Memory pressure possible | Consider Azure Queue fan-out pattern |
+| **Articles > 10K/day** | Transaction costs noticeable | Optimize batch sizes, reduce duplicate checks |
+| **Storage > 10 GB** | Consider lifecycle management | Enable Table Storage tiering or cleanup |
+| **Cold storage > 50 GB** | Purge strategy needed | Implement 1-year purge (Phase 6) |
+
+### Partition Size Limits
+
+Azure Table Storage has partition limits to consider:
+
+| Limit | Value | Impact |
+|-------|-------|--------|
+| Max entities per partition | Unlimited (soft limit ~10M) | Date-based partitions stay small |
+| Max partition throughput | 2,000 entities/second | Easily sufficient for our use case |
+| Max entity size | 1 MB | Article metadata well under limit (~2 KB) |
+| Max property value size | 64 KB | Description field may need truncation |
+
+**Our Design:**
+- Daily partitions: ~200-2,000 entities each (well under limits)
+- ArticleLookup: Partitioned by FeedId (~20-50 entities per partition per day)
+- No partition hotspots expected
+
+### Cost Optimization Strategies
+
+1. **Batch Operations**
+   - Use `TableTransactionAction` for batch inserts (100 entities per batch)
+   - Reduces transaction count by ~90%
+
+2. **Smart Deduplication**
+   - Check ArticleLookup before fetching full article details
+   - Cache recent article hashes in memory during aggregation run
+
+3. **Efficient Queries**
+   - Always use PartitionKey in queries (avoid table scans)
+   - Project only needed properties with `Select`
+
+4. **Archival Optimization**
+   - Archive entire partitions at once (not individual entities)
+   - Use batch deletes
+
+5. **Cold Storage Purge**
+   - Delete entire month partitions when purging (efficient)
+
+---
+
 ## Data Models
 
 ### Feed Source (feeds.json)
