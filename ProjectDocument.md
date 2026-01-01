@@ -52,7 +52,7 @@
 
 | Component | Description |
 |-----------|-------------|
-| **Timer Trigger** | Azure Functions timer that fires every hour (CRON: `0 0 * * * *`) |
+| **Timer Trigger** | Azure Functions timer that fires every 15 minutes (CRON: `0 */15 * * * *`) |
 | **Aggregator Function** | Core logic that reads config, fetches RSS feeds, parses articles |
 | **Feed Configuration** | `feeds.json` - Central JSON file containing all RSS feed URLs and metadata |
 | **Azure Table Storage** | NoSQL storage for persisted news articles |
@@ -64,7 +64,7 @@ FeedStackEngine/
 ├── src/
 │   └── FeedStackEngine.Functions/           # Azure Functions project
 │       ├── Functions/
-│       │   ├── NewsAggregatorFunction.cs     # Timer-triggered (hourly) - fetch feeds
+│       │   ├── NewsAggregatorFunction.cs     # Timer-triggered (every 15 min) - fetch feeds
 │       │   └── ArticleArchiverFunction.cs    # Timer-triggered (daily) - archive old articles
 │       ├── Services/
 │       │   ├── IFeedParserService.cs         # Interface for feed parsing
@@ -73,11 +73,16 @@ FeedStackEngine/
 │       │   ├── ArticleTableService.cs        # Azure Table operations (hot + cold)
 │       │   ├── IArticleLookupService.cs      # Interface for deduplication
 │       │   ├── ArticleLookupService.cs       # Deduplication service
+│       │   ├── IFeedStateService.cs          # Interface for feed state tracking
+│       │   ├── FeedStateService.cs           # Last fetch time tracking
+│       │   ├── IFeedSchedulerService.cs      # Interface for feed scheduling
+│       │   ├── FeedSchedulerService.cs       # Determines which feeds are due
 │       │   ├── IFeedConfigService.cs         # Interface for feed config
 │       │   └── FeedConfigService.cs          # Load feeds from config
 │       ├── Models/
 │       │   ├── ArticleEntity.cs              # Article table entity
 │       │   ├── ArticleLookupEntity.cs        # Lookup table entity
+│       │   ├── FeedStateEntity.cs            # Feed scheduling state entity
 │       │   ├── FeedSource.cs                 # Feed source model
 │       │   └── FeedConfiguration.cs          # Configuration model
 │       ├── Utilities/
@@ -109,21 +114,32 @@ FeedStackEngine/
 ### Core Features
 
 1. **Scheduled Aggregation**
-   - Timer-triggered Azure Function runs every hour
-   - Fetches all configured RSS feeds in parallel
+   - Timer-triggered Azure Function runs every 15 minutes
+   - Per-feed refresh intervals (15min, 1hr, 4hr, 8hr, 12hr) determine which feeds to process
+   - Only fetches feeds that are "due" based on their last fetch time
+   - Fetches eligible RSS feeds in parallel
    - Handles feed failures gracefully (continues with other feeds)
 
 2. **Feed Configuration Management**
    - Central `feeds.json` file for all RSS sources
    - Support for feed metadata (category, priority, enabled/disabled)
+   - Per-feed `refreshIntervalMinutes` for scheduling (15, 60, 240, 480, 720)
    - Easy to add/remove feeds without code changes
 
-3. **Article Storage**
+3. **Feed Scheduling**
+   - `FeedState` table tracks last fetch time per feed
+   - Scheduler determines which feeds are "due" on each function run
+   - High-priority breaking news feeds can run every 15 min
+   - Standard news sources run hourly
+   - Low-frequency sources (magazines, weekly digests) run every 4-12 hours
+   - Reduces unnecessary API calls and processing for slow-updating feeds
+
+4. **Article Storage**
    - Store articles in Azure Table Storage
    - Deduplication based on article URL/GUID
    - Track article metadata (source, published date, fetch date)
 
-4. **Error Handling & Logging**
+5. **Error Handling & Logging**
    - Log failed feed fetches
    - Retry logic for transient failures
    - Application Insights integration (optional)
@@ -131,28 +147,37 @@ FeedStackEngine/
 ### Data Flow
 
 ```
-1. Timer fires (every hour)
+1. Timer fires (every 15 minutes)
        │
        ▼
 2. Load feeds.json configuration
        │
        ▼
-3. Fetch RSS feeds in parallel
+3. Load FeedState table (last fetch times)
        │
        ▼
-4. Parse each feed (RSS/Atom)
+4. Filter feeds to only those "due" for refresh
        │
        ▼
-5. Extract articles with metadata
+5. Fetch eligible RSS feeds in parallel
        │
        ▼
-6. Check for duplicates in Table Storage
+6. Parse each feed (RSS/Atom)
        │
        ▼
-7. Insert new articles into Table Storage
+7. Extract articles with metadata
        │
        ▼
-8. Log summary (new articles, failures, etc.)
+8. Check for duplicates in Table Storage
+       │
+       ▼
+9. Insert new articles into Table Storage
+       │
+       ▼
+10. Update FeedState with new fetch times
+       │
+       ▼
+11. Log summary (new articles, skipped feeds, failures)
 ```
 
 ### Dependencies
@@ -184,236 +209,6 @@ FeedStackEngine/
 
 ---
 
-## Capacity Planning & Cost Analysis
-
-This section provides detailed calculations for storage, transactions, and costs at different scales.
-
-### Assumptions
-
-| Parameter | Value | Notes |
-|-----------|-------|-------|
-| Average articles per feed per day | 15-25 | Varies by feed type |
-| Average article size (metadata only) | ~2 KB | Title, description, URL, etc. |
-| ArticleLookup entry size | ~0.5 KB | Minimal fields for dedup |
-| Hot storage retention | 90 days | Before archival |
-| Cold storage retention | 1 year | Before purge (future) |
-| Aggregation frequency | 24 times/day | Hourly |
-| Archival frequency | 1 time/day | Daily at 2 AM |
-
-### Scenario 1: Small Scale (8-10 Feeds)
-
-**Daily Data Generation:**
-```
-Feeds: 10
-Articles per feed per day: 20 (average)
-Total articles per day: 10 × 20 = 200 articles
-Article size: 2 KB
-Lookup entry size: 0.5 KB
-
-Daily storage growth:
-  NewsArticles: 200 × 2 KB = 400 KB/day
-  ArticleLookup: 200 × 0.5 KB = 100 KB/day
-  Total: ~500 KB/day = ~0.5 MB/day
-```
-
-**Monthly & Annual Storage:**
-| Timeframe | Hot Storage | Cold Storage | Lookup Table | Total |
-|-----------|-------------|--------------|--------------|-------|
-| 1 month | 15 MB | 0 | 15 MB | 30 MB |
-| 90 days | 45 MB | 0 | 45 MB | 90 MB |
-| 6 months | 45 MB | 45 MB | 90 MB | 180 MB |
-| 1 year | 45 MB | 135 MB | 180 MB | 360 MB |
-
-**Transaction Costs (Monthly):**
-```
-Aggregation runs: 24/day × 30 days = 720 runs
-
-Per aggregation run:
-  - Read feeds.json: ~1 read
-  - Lookup checks: 200 articles × 1 read = 200 reads
-  - Article inserts: 200 articles × 2 writes (article + lookup) = 400 writes
-  - Assuming 50% duplicates after first fetch: 100 new × 2 = 200 writes
-
-Daily transactions:
-  - Reads: 24 × (1 + 200) = 4,824 reads
-  - Writes: 24 × 200 = 4,800 writes (assuming 50% dedup)
-  
-Monthly transactions:
-  - Reads: ~145,000
-  - Writes: ~144,000
-  - Total: ~289,000 transactions
-
-Archival (monthly):
-  - Read old partitions: ~3,000 reads
-  - Write to archive: ~3,000 writes
-  - Delete from hot: ~3,000 deletes
-  - Total: ~9,000 transactions
-
-Grand total: ~298,000 transactions/month
-```
-
-**Monthly Cost Estimate (Small Scale):**
-| Resource | Calculation | Cost |
-|----------|-------------|------|
-| Storage (360 MB after 1 year) | 0.36 GB × $0.045/GB | $0.02 |
-| Transactions (298K) | 298K ÷ 10K × $0.00036 | $0.01 |
-| Azure Functions (720 executions) | Free tier | $0.00 |
-| **Total Monthly** | | **< $0.10** |
-
----
-
-### Scenario 2: Medium Scale (50 Feeds)
-
-**Daily Data Generation:**
-```
-Feeds: 50
-Articles per feed per day: 20 (average)
-Total articles per day: 50 × 20 = 1,000 articles
-
-Daily storage growth:
-  NewsArticles: 1,000 × 2 KB = 2 MB/day
-  ArticleLookup: 1,000 × 0.5 KB = 0.5 MB/day
-  Total: ~2.5 MB/day
-```
-
-**Monthly & Annual Storage:**
-| Timeframe | Hot Storage | Cold Storage | Lookup Table | Total |
-|-----------|-------------|--------------|--------------|-------|
-| 1 month | 75 MB | 0 | 75 MB | 150 MB |
-| 90 days | 225 MB | 0 | 225 MB | 450 MB |
-| 6 months | 225 MB | 225 MB | 450 MB | 900 MB |
-| 1 year | 225 MB | 675 MB | 900 MB | 1.8 GB |
-
-**Transaction Costs (Monthly):**
-```
-Per aggregation run (assuming 50% duplicates):
-  - Lookup reads: 1,000
-  - New article writes: 500 × 2 = 1,000
-
-Daily: 24 × (1,000 + 1,000) = 48,000 transactions
-Monthly: ~1.44M transactions + ~45K archival = ~1.5M transactions
-```
-
-**Monthly Cost Estimate (Medium Scale):**
-| Resource | Calculation | Cost |
-|----------|-------------|------|
-| Storage (1.8 GB after 1 year) | 1.8 GB × $0.045/GB | $0.08 |
-| Transactions (1.5M) | 1.5M ÷ 10K × $0.00036 | $0.05 |
-| Azure Functions (720 executions) | Free tier | $0.00 |
-| **Total Monthly** | | **< $0.15** |
-
----
-
-### Scenario 3: Large Scale (100+ Feeds)
-
-**Daily Data Generation:**
-```
-Feeds: 100
-Articles per feed per day: 20 (average)
-Total articles per day: 100 × 20 = 2,000 articles
-
-Daily storage growth:
-  NewsArticles: 2,000 × 2 KB = 4 MB/day
-  ArticleLookup: 2,000 × 0.5 KB = 1 MB/day
-  Total: ~5 MB/day
-```
-
-**Monthly & Annual Storage:**
-| Timeframe | Hot Storage | Cold Storage | Lookup Table | Total |
-|-----------|-------------|--------------|--------------|-------|
-| 1 month | 150 MB | 0 | 150 MB | 300 MB |
-| 90 days | 450 MB | 0 | 450 MB | 900 MB |
-| 6 months | 450 MB | 450 MB | 900 MB | 1.8 GB |
-| 1 year | 450 MB | 1.35 GB | 1.8 GB | 3.6 GB |
-
-**Transaction Costs (Monthly):**
-```
-Per aggregation run (assuming 50% duplicates):
-  - Lookup reads: 2,000
-  - New article writes: 1,000 × 2 = 2,000
-
-Daily: 24 × (2,000 + 2,000) = 96,000 transactions
-Monthly: ~2.9M transactions + ~90K archival = ~3M transactions
-```
-
-**Monthly Cost Estimate (Large Scale):**
-| Resource | Calculation | Cost |
-|----------|-------------|------|
-| Storage (3.6 GB after 1 year) | 3.6 GB × $0.045/GB | $0.16 |
-| Transactions (3M) | 3M ÷ 10K × $0.00036 | $0.11 |
-| Azure Functions (720 executions) | Free tier | $0.00 |
-| **Total Monthly** | | **< $0.30** |
-
----
-
-### Cost Comparison Summary
-
-| Scale | Feeds | Daily Articles | Storage (1 year) | Monthly Cost |
-|-------|-------|----------------|------------------|--------------|
-| Small | 10 | 200 | 360 MB | < $0.10 |
-| Medium | 50 | 1,000 | 1.8 GB | < $0.15 |
-| Large | 100 | 2,000 | 3.6 GB | < $0.30 |
-| Enterprise | 500 | 10,000 | 18 GB | < $1.50 |
-
-### Future Feature Cost Impact
-
-| Feature | Additional Cost Impact |
-|---------|----------------------|
-| **Keyword Search (Option C - KeywordIndex)** | +50% storage, +100% transactions (~$0.30/month at large scale) |
-| **Keyword Search (Option A - Azure Cognitive Search)** | +$75-250/month (Basic to Standard tier) |
-| **Tag-based Personalization** | +10% transactions for TagIndex (~$0.03/month) |
-| **HTTP API (moderate usage)** | +$0-5/month (depends on traffic, mostly free tier) |
-| **Application Insights** | +$0-10/month (depends on log volume, free tier available) |
-
-### Scaling Thresholds & Recommendations
-
-| Metric | Threshold | Recommendation |
-|--------|-----------|----------------|
-| **Feeds > 50** | Concurrency matters | Batch feeds into groups, use SemaphoreSlim(10) |
-| **Feeds > 100** | Memory pressure possible | Consider Azure Queue fan-out pattern |
-| **Articles > 10K/day** | Transaction costs noticeable | Optimize batch sizes, reduce duplicate checks |
-| **Storage > 10 GB** | Consider lifecycle management | Enable Table Storage tiering or cleanup |
-| **Cold storage > 50 GB** | Purge strategy needed | Implement 1-year purge (Phase 6) |
-
-### Partition Size Limits
-
-Azure Table Storage has partition limits to consider:
-
-| Limit | Value | Impact |
-|-------|-------|--------|
-| Max entities per partition | Unlimited (soft limit ~10M) | Date-based partitions stay small |
-| Max partition throughput | 2,000 entities/second | Easily sufficient for our use case |
-| Max entity size | 1 MB | Article metadata well under limit (~2 KB) |
-| Max property value size | 64 KB | Description field may need truncation |
-
-**Our Design:**
-- Daily partitions: ~200-2,000 entities each (well under limits)
-- ArticleLookup: Partitioned by FeedId (~20-50 entities per partition per day)
-- No partition hotspots expected
-
-### Cost Optimization Strategies
-
-1. **Batch Operations**
-   - Use `TableTransactionAction` for batch inserts (100 entities per batch)
-   - Reduces transaction count by ~90%
-
-2. **Smart Deduplication**
-   - Check ArticleLookup before fetching full article details
-   - Cache recent article hashes in memory during aggregation run
-
-3. **Efficient Queries**
-   - Always use PartitionKey in queries (avoid table scans)
-   - Project only needed properties with `Select`
-
-4. **Archival Optimization**
-   - Archive entire partitions at once (not individual entities)
-   - Use batch deletes
-
-5. **Cold Storage Purge**
-   - Delete entire month partitions when purging (efficient)
-
----
-
 ## Data Models
 
 ### Feed Source (feeds.json)
@@ -428,6 +223,7 @@ Azure Table Storage has partition limits to consider:
       "category": "technology",
       "country": "US",
       "priority": "headline",
+      "refreshIntervalMinutes": 15,
       "enabled": true,
       "parserConfig": null
     },
@@ -438,6 +234,7 @@ Azure Table Storage has partition limits to consider:
       "category": "world",
       "country": "GB",
       "priority": "headline",
+      "refreshIntervalMinutes": 15,
       "enabled": true,
       "parserConfig": {
         "imageSource": "mediaThumbnail",
@@ -451,6 +248,7 @@ Azure Table Storage has partition limits to consider:
       "category": "technology",
       "country": "US",
       "priority": "standard",
+      "refreshIntervalMinutes": 60,
       "enabled": true,
       "parserConfig": {
         "imageSource": "contentHtml",
@@ -461,8 +259,10 @@ Azure Table Storage has partition limits to consider:
     }
   ],
   "settings": {
-    "retentionDays": 90,
-    "maxConcurrentFeeds": 10
+    "retentionDays": 30,
+    "maxConcurrentFeeds": 10,
+    "defaultRefreshIntervalMinutes": 60,
+    "allowedRefreshIntervals": [15, 60, 240, 480, 720]
   },
   "priorityDefinitions": {
     "headline": {
@@ -751,31 +551,34 @@ FeedStackEngine/
 
 ### Multi-Table Storage Design
 
-To optimize for **fast latest news queries** while supporting **90-day retention with cold archival**, we use a multi-table architecture:
+To optimize for **fast latest news queries** while supporting **30-day retention with cold archival**, we use a multi-table architecture:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                         TABLE STORAGE DESIGN                            │
 │                                                                         │
-│  ┌─────────────────────┐     90 days      ┌─────────────────────┐      │
+│  ┌─────────────────────┐     30 days      ┌─────────────────────┐      │
 │  │   NewsArticles      │ ───────────────▶ │   NewsArchive       │      │
 │  │   (Hot Storage)     │   Daily Cleanup  │   (Cold Storage)    │      │
 │  │                     │                  │                     │      │
-│  │ • Latest 90 days    │                  │ • Articles > 90 days│      │
+│  │ • Latest 30 days    │                  │ • Articles > 30 days│      │
 │  │ • Fast recency query│                  │ • Rarely accessed   │      │
 │  │ • Inverted timestamp│                  │ • Standard partition│      │
 │  └─────────────────────┘                  └─────────────────────┘      │
 │                                                                         │
-│  ┌─────────────────────┐                                               │
-│  │   ArticleLookup     │  (Deduplication & cross-reference)            │
-│  │   (Index Table)     │                                               │
-│  └─────────────────────┘                                               │
+│  ┌─────────────────────┐                  ┌─────────────────────┐      │
+│  │   ArticleLookup     │                  │   FeedState         │      │
+│  │   (Dedup Index)     │                  │   (Scheduler)       │      │
+│  │                     │                  │                     │      │
+│  │ • Fast dedup check  │                  │ • Last fetch times  │      │
+│  │ • Cross-reference   │                  │ • Per-feed tracking │      │
+│  └─────────────────────┘                  └─────────────────────┘      │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-### Table 1: NewsArticles (Hot Storage - Latest 90 Days)
+### Table 1: NewsArticles (Hot Storage - Latest 30 Days)
 
 **Optimized for**: "Get latest news" queries, sorted by most recent first.
 
@@ -802,7 +605,7 @@ To optimize for **fast latest news queries** while supporting **90-day retention
 
 1. **PartitionKey = Date (`YYYY-MM-DD`)**
    - Enables efficient range queries: "Get all articles from today"
-   - Easy cleanup: Delete entire partition when > 90 days old
+   - Easy cleanup: Delete entire partition when > 30 days old
    - Natural data distribution across partitions
 
 2. **RowKey = `{InvertedTimestamp}_{FeedId}_{ArticleHash}`**
@@ -833,7 +636,7 @@ InvertedTicks = MAX_TICKS - article.PublishedDate.Ticks
 
 ---
 
-### Table 2: NewsArchive (Cold Storage - 90+ Days)
+### Table 2: NewsArchive (Cold Storage - 30+ Days)
 
 **Optimized for**: Long-term storage with **same schema as hot storage** for consistent querying.
 
@@ -885,13 +688,73 @@ InvertedTicks = MAX_TICKS - article.PublishedDate.Ticks
 
 ---
 
+### Table 4: FeedState (Scheduling Tracker)
+
+**Purpose**: Track last fetch time per feed to implement per-feed refresh intervals.
+
+| Property | Type | Description |
+|----------|------|-------------|
+| **PartitionKey** | string | `"feeds"` (single partition for all feeds) |
+| **RowKey** | string | `{FeedId}` |
+| **LastFetchTime** | DateTime | Last successful fetch timestamp (UTC) |
+| **LastFetchStatus** | string | `"success"`, `"failed"`, `"skipped"` |
+| **ArticlesFetched** | int | Number of articles retrieved in last fetch |
+| **ConsecutiveFailures** | int | Track retry backoff for failing feeds |
+
+**Scheduling Logic:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     FEED SCHEDULING ALGORITHM                           │
+│                                                                         │
+│   On each function run (every 15 minutes):                              │
+│                                                                         │
+│   1. Load all feed configs from feeds.json                              │
+│   2. Load FeedState table (all rows in "feeds" partition)               │
+│   3. For each enabled feed:                                             │
+│      │                                                                  │
+│      ├─ Get feed.refreshIntervalMinutes (default: 60)                   │
+│      ├─ Get feedState.LastFetchTime (default: DateTime.MinValue)        │
+│      ├─ Calculate: minutesSinceLastFetch = Now - LastFetchTime          │
+│      │                                                                  │
+│      └─ IF minutesSinceLastFetch >= refreshIntervalMinutes              │
+│            ✅ Feed is DUE → Add to fetch list                           │
+│         ELSE                                                            │
+│            ⏭️ Feed is NOT due → Skip this run                           │
+│                                                                         │
+│   4. Fetch only the "due" feeds in parallel                             │
+│   5. Update FeedState with new LastFetchTime for each processed feed    │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Example Scheduling Scenarios:**
+
+| Feed | Refresh Interval | Last Fetch | Current Time | Status |
+|------|------------------|------------|--------------|--------|
+| bbc-world | 15 min | 10:00 AM | 10:15 AM | ✅ DUE (15 min elapsed) |
+| techcrunch | 15 min | 10:05 AM | 10:15 AM | ⏭️ SKIP (10 min elapsed) |
+| reddit-tech | 60 min | 9:30 AM | 10:15 AM | ⏭️ SKIP (45 min elapsed) |
+| medium-weekly | 720 min | 6:00 AM | 10:15 AM | ⏭️ SKIP (4h 15m elapsed) |
+
+**Refresh Interval Options:**
+
+| Interval | Minutes | Use Case |
+|----------|---------|----------|
+| **15 min** | 15 | Breaking news sources (BBC, Reuters, AP) |
+| **1 hour** | 60 | Active news sites (TechCrunch, Ars Technica) |
+| **4 hours** | 240 | Less frequent sources (blogs, forums) |
+| **8 hours** | 480 | Daily digests, newsletters |
+| **12 hours** | 720 | Weekly publications, slow sources |
+
+---
+
 ### Retention & Archival Process
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │              DAILY ARCHIVAL FUNCTION (Timer: 2 AM UTC)          │
 │                                                                 │
-│   1. Calculate cutoff date: Today - 90 days                     │
+│   1. Calculate cutoff date: Today - 30 days                     │
 │                     │                                           │
 │                     ▼                                           │
 │   2. Query NewsArticles partitions older than cutoff            │
@@ -998,7 +861,7 @@ GET /api/feeds              → Feed list with inline stats
 
 #### ⚠️ Design Gap 3: Combined Hot + Cold Queries
 
-**Problem**: Seamless querying across 90-day boundary (hot → cold tables).
+**Problem**: Seamless querying across 30-day boundary (hot → cold tables).
 
 **Solution**: Service layer abstraction that queries both tables transparently.
 
@@ -1011,8 +874,8 @@ public async Task<PagedResult<Article>> GetArticles(ArticleQuery query)
     var hotResults = await QueryHotStorage(query);
     results.AddRange(hotResults);
     
-    // 2. If date range extends beyond 90 days, also query cold storage
-    if (query.StartDate < DateTime.UtcNow.AddDays(-90))
+    // 2. If date range extends beyond 30 days, also query cold storage
+    if (query.StartDate < DateTime.UtcNow.AddDays(-30))
     {
         var coldResults = await QueryColdStorage(query);
         results.AddRange(coldResults);
@@ -1195,11 +1058,13 @@ This single addition ensures O(1) article retrieval for future API without redes
 
 #### Step 2.1: Create Feed Configuration Models
 - [ ] Create `FeedSource.cs` model class
-  - Properties: Id, Name, Url, Category, Country, Priority, Enabled
+  - Properties: Id, Name, Url, Category, Country, Priority, RefreshIntervalMinutes, Enabled
 - [ ] Create `FeedParserConfig.cs` model class
   - Properties: ImageSource, ImageRegex, DescriptionSource, StripHtml, MaxDescriptionLength
 - [ ] Create `FeedConfiguration.cs` root model
   - Properties: Feeds (list), Settings, ParserDefaults, PriorityDefinitions
+- [ ] Create `FeedSettings.cs` model class
+  - Properties: RetentionDays, MaxConcurrentFeeds, DefaultRefreshIntervalMinutes, AllowedRefreshIntervals
 - [ ] Create `PriorityDefinition.cs` model
   - Properties: DisplayOrder, Description, BoostFactor
 - [ ] Write unit tests for model serialization/deserialization
@@ -1209,14 +1074,17 @@ This single addition ensures O(1) article retrieval for future API without redes
   - All properties: PartitionKey, RowKey, Title, Link, Description, PublishedDate, FetchedDate, FeedId, FeedName, Author, Category, Country, Priority, ImageUrl, ArticleHash, Tags
 - [ ] Create `ArticleLookupEntity.cs` implementing `ITableEntity`
   - Properties: PartitionKey (FeedId), RowKey (ArticleHash), OriginalPartition, OriginalRowKey, CreatedDate
+- [ ] Create `FeedStateEntity.cs` implementing `ITableEntity`
+  - Properties: PartitionKey ("feeds"), RowKey (FeedId), LastFetchTime, LastFetchStatus, ArticlesFetched, ConsecutiveFailures
 - [ ] Write unit tests verifying entity property mappings
 
 #### Step 2.3: Create Initial feeds.json
 - [ ] Create `Config/feeds.json` with 3-5 sample feeds
-- [ ] Include at least one `headline` priority feed
-- [ ] Include at least one `standard` priority feed
+- [ ] Include at least one `headline` priority feed with 15-minute refresh
+- [ ] Include at least one `standard` priority feed with 60-minute refresh
 - [ ] Include feeds from different countries (US, GB)
 - [ ] Include at least one feed requiring custom parserConfig
+- [ ] Set appropriate `refreshIntervalMinutes` per feed (15, 60, 240, 480, or 720)
 - [ ] Set file to "Copy to Output Directory: Copy if newer"
 
 #### Step 2.4: Create Feed Configuration Service
@@ -1306,7 +1174,21 @@ This single addition ensures O(1) article retrieval for future API without redes
   - Implement all interface methods
 - [ ] Register service in DI container
 
-#### Step 4.4: Create Combined Storage Service
+#### Step 4.4: Create Feed State Service
+- [ ] Create `Services/IFeedStateService.cs` interface
+  - Method: `Task<FeedStateEntity?> GetFeedStateAsync(string feedId)`
+  - Method: `Task<IEnumerable<FeedStateEntity>> GetAllFeedStatesAsync()`
+  - Method: `Task UpdateFeedStateAsync(string feedId, DateTime fetchTime, string status, int articlesFetched)`
+  - Method: `Task IncrementFailureCountAsync(string feedId)`
+- [ ] Create `Services/FeedStateService.cs` implementation
+  - Table name: `FeedState`
+  - PartitionKey: `"feeds"` (single partition for all)
+  - RowKey: `{FeedId}`
+  - Handle missing state entries (first fetch scenario)
+- [ ] Register service in DI container
+- [ ] Write integration tests with Azurite
+
+#### Step 4.5: Create Combined Storage Service
 - [ ] Create `Services/INewsStorageService.cs` interface
   - Method: `Task<SaveResult> SaveArticleAsync(ArticleEntity article)`
   - Returns: SaveResult { Saved, Duplicate, Error }
@@ -1317,7 +1199,24 @@ This single addition ensures O(1) article retrieval for future API without redes
   - Handle duplicates gracefully
 - [ ] Register service in DI container
 
-#### Step 4.5: Set Up Local Testing with Azurite
+#### Step 4.6: Create Feed Scheduler Service
+- [ ] Create `Services/IFeedSchedulerService.cs` interface
+  - Method: `Task<IEnumerable<FeedSource>> GetFeedsDueForRefreshAsync()`
+  - Method: `Task MarkFeedFetchedAsync(string feedId, int articleCount)`
+  - Method: `Task MarkFeedFailedAsync(string feedId)`
+- [ ] Create `Services/FeedSchedulerService.cs` implementation
+  - Inject IFeedConfigService and IFeedStateService
+  - Compare `lastFetchTime + refreshIntervalMinutes` vs `DateTime.UtcNow`
+  - First-run feeds (no state entry) are always due
+  - Apply consecutive failure backoff (optional: exponential delay)
+- [ ] Register service in DI container
+- [ ] Write unit tests with mock state data
+  - Test: Feed with no prior state → due
+  - Test: Feed fetched 10 min ago, interval 15 min → not due
+  - Test: Feed fetched 20 min ago, interval 15 min → due
+  - Test: Feed fetched 2 hours ago, interval 60 min → due
+
+#### Step 4.7: Set Up Local Testing with Azurite
 - [ ] Install Azurite: `npm install -g azurite`
 - [ ] Create script/instructions to start Azurite
 - [ ] Update `local.settings.json` with Azurite connection string
@@ -1326,9 +1225,10 @@ This single addition ensures O(1) article retrieval for future API without redes
   - Inserts an article
   - Verifies it exists in both tables
   - Attempts duplicate insert (should skip)
+  - Updates feed state after fetch
 - [ ] Verify all integration tests pass with Azurite
 
-**Checkpoint 4**: Can save articles to local Table Storage, deduplication works
+**Checkpoint 4**: Can save articles to local Table Storage, deduplication works, scheduling logic verified
 
 ---
 
@@ -1406,13 +1306,14 @@ This single addition ensures O(1) article retrieval for future API without redes
 - [ ] Create `Services/IAggregationService.cs` interface
   - Method: `Task<AggregationResult> AggregateAllFeedsAsync()`
 - [ ] Create `Models/AggregationResult.cs`
-  - Properties: TotalFeeds, SuccessfulFeeds, FailedFeeds, NewArticles, Duplicates, Errors, Duration
+  - Properties: TotalFeeds, FeedsDue, FeedsSkipped, SuccessfulFeeds, FailedFeeds, NewArticles, Duplicates, Errors, Duration
 - [ ] Create `Services/AggregationService.cs` implementation
-  - Inject: IFeedConfigService, IFeedParserService, IArticleMapper, INewsStorageService
-  - Load enabled feeds
-  - Parse each feed (parallel with concurrency limit)
+  - Inject: IFeedSchedulerService, IFeedParserService, IArticleMapper, INewsStorageService
+  - Call `GetFeedsDueForRefreshAsync()` to get only scheduled feeds
+  - Parse each due feed (parallel with concurrency limit)
   - Map articles to entities
   - Save to storage (handles deduplication)
+  - Call `MarkFeedFetchedAsync()` or `MarkFeedFailedAsync()` for each feed
   - Collect and return statistics
 - [ ] Register service in DI container
 
@@ -1439,10 +1340,14 @@ This single addition ensures O(1) article retrieval for future API without redes
 
 #### Step 7.1: Create NewsAggregator Function
 - [ ] Create `Functions/NewsAggregatorFunction.cs`
-- [ ] Add TimerTrigger attribute with CRON: `0 0 * * * *` (every hour)
+- [ ] Add TimerTrigger attribute with CRON: `0 */15 * * * *` (every 15 minutes)
 - [ ] Inject IAggregationService
 - [ ] Call AggregateAllFeedsAsync()
-- [ ] Log aggregation results summary
+- [ ] Log aggregation results summary including:
+  - Number of feeds due vs skipped
+  - New articles saved
+  - Duplicates skipped
+  - Any failures
 - [ ] Handle and log any exceptions
 
 #### Step 7.2: Test Locally with Manual Trigger
@@ -1450,20 +1355,23 @@ This single addition ensures O(1) article retrieval for future API without redes
 - [ ] Start Azurite
 - [ ] Run function locally: `func start`
 - [ ] Verify function triggers
+- [ ] Verify only "due" feeds are processed (check FeedState table)
 - [ ] Verify articles saved to Azurite tables
-- [ ] Check logs for proper output
-- [ ] Revert CRON to hourly after testing
+- [ ] Check logs for scheduling decisions (due/skipped)
+- [ ] Run function multiple times, verify feeds respect their intervals
+- [ ] Revert CRON to every 15 minutes after testing
 
 #### Step 7.3: Add Function Configuration
 - [ ] Read settings from `local.settings.json`:
   - `MaxConcurrentFeeds`
   - `FeedTimeoutSeconds`
+  - `DefaultRefreshIntervalMinutes`
   - `StorageConnectionString`
 - [ ] Create `Options/AggregationOptions.cs` for typed configuration
 - [ ] Register options in DI with `.Configure<AggregationOptions>()`
 - [ ] Verify settings are applied
 
-**Checkpoint 7**: Timer function works, aggregates feeds hourly, saves to storage
+**Checkpoint 7**: Timer function works every 15 min, only processes due feeds, updates state correctly
 
 ---
 
@@ -1496,12 +1404,12 @@ This single addition ensures O(1) article retrieval for future API without redes
 - [ ] Create `Functions/ArticleArchiverFunction.cs`
 - [ ] Add TimerTrigger with CRON: `0 0 2 * * *` (daily at 2 AM UTC)
 - [ ] Inject IArchivalService
-- [ ] Read retentionDays from settings (default: 90)
+- [ ] Read retentionDays from settings (default: 30)
 - [ ] Call ArchiveOldArticlesAsync()
 - [ ] Log archival results summary
 
 #### Step 8.4: Test Archival Locally
-- [ ] Insert test articles with old dates (>90 days ago) using a test script
+- [ ] Insert test articles with old dates (>30 days ago) using a test script
 - [ ] Run archival function manually
 - [ ] Verify articles moved to NewsArchive table
 - [ ] Verify articles deleted from NewsArticles table
@@ -1623,7 +1531,7 @@ This single addition ensures O(1) article retrieval for future API without redes
 | **Embedded JSON config over Blob Storage** | Simpler deployment, version-controlled, no extra service complexity |
 | **Date-based PartitionKey (hot)** | Enables fast "latest news" queries and efficient partition-level cleanup |
 | **Inverted timestamp in RowKey** | Ensures newest articles sort first within each partition |
-| **Separate hot/cold tables (same schema)** | Hot table stays small (<90 days); cold table uses identical schema for consistent querying |
+| **Separate hot/cold tables (same schema)** | Hot table stays small (<30 days); cold table uses identical schema for consistent querying |
 | **ArticleLookup table for dedup** | O(1) duplicate check without scanning large tables |
 
 ### Scaling Considerations
@@ -1649,14 +1557,14 @@ This single addition ensures O(1) article retrieval for future API without redes
 |---------|-------|
 | Aggregation frequency | Every hour (`0 0 * * * *`) |
 | Archival frequency | Daily at 2 AM UTC (`0 0 2 * * *`) |
-| Retention period | 90 days |
+| Retention period | 30 days |
 | Max concurrent feeds | 10 (configurable) |
 | Initial feed count | 8-10 |
 | Target feed count | 100+ |
 
 ### Open Questions
 - [x] ~~How many feeds do we anticipate?~~ → 8-10 initially, 100+ later
-- [x] ~~Retention policy?~~ → 90 days hot, then archive to cold storage
+- [x] ~~Retention policy?~~ → 30 days hot, then archive to cold storage
 - [x] ~~Do we need full article content or just metadata?~~ → **Metadata only** (title, description, link)
 - [x] ~~Should we store images locally or just reference URLs?~~ → **URLs only** (ImageUrl field stores link)
 - [x] ~~Do we need to purge cold storage eventually?~~ → **Yes, after 1 year** (low priority feature)
@@ -1667,8 +1575,8 @@ This single addition ensures O(1) article retrieval for future API without redes
 |--------|----------|
 | **Article Content** | Metadata only - title, description/snippet, link to full article |
 | **Images** | Store URL reference only (no local storage/blob) |
-| **Hot Storage** | 90 days in NewsArticles table |
-| **Cold Storage** | 90 days → 1 year in NewsArchive table |
+| **Hot Storage** | 30 days in NewsArticles table |
+| **Cold Storage** | 30 days → 1 year in NewsArchive table |
 | **Purge** | Delete from NewsArchive after 1 year (Phase 6 - low priority) |
 
 ---
